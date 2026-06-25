@@ -34,6 +34,8 @@ npm start
 - `/whoami`: show server, workspace, and Codex version.
 - `/codex <task>`: run a new non-interactive Codex task.
 - `/resume <task>`: continue the last non-interactive Codex session.
+- Any normal message: send it directly to Codex. The bot resumes the previous Codex session unless `/new` or `/clear` was used.
+- `/new` or `/clear`: make the next normal message start a fresh Codex session.
 - `/cancel`: stop the currently running Codex process.
 
 ## Safety

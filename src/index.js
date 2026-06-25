@@ -45,6 +45,7 @@ if (execMode === "zeabur") {
 
 let updateOffset = 0;
 let currentTask = null;
+const chatState = new Map();
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
@@ -147,6 +148,12 @@ async function handleUpdate(update) {
     return;
   }
 
+  if (text === "/new" || text === "/clear") {
+    chatState.set(chatId, { shouldResume: false });
+    await sendMessage(chatId, "New Codex conversation ready.");
+    return;
+  }
+
   if (text === "/cancel") {
     await cancelTask(chatId);
     return;
@@ -162,18 +169,28 @@ async function handleUpdate(update) {
     return;
   }
 
-  await sendMessage(chatId, "Unknown command. Use /help.");
+  if (text.startsWith("/")) {
+    await sendMessage(chatId, "Unknown command. Use /help.");
+    return;
+  }
+
+  const state = chatState.get(chatId) || { shouldResume: false };
+  await runCodex(chatId, text, state.shouldResume);
 }
 
 function helpText() {
   return [
     "Codex Telegram Bot",
     "",
+    "/new - start a fresh Codex conversation on the next message",
+    "/clear - same as /new",
     "/status - show current task",
     "/whoami - show server and Codex info",
-    "/codex <task> - run a new Codex task",
-    "/resume <task> - continue the last Codex exec session",
+    "/codex <task> - force a new Codex task",
+    "/resume <task> - force resume of the last Codex exec session",
     "/cancel - stop the running task",
+    "",
+    "Send any normal message to talk to Codex.",
     "",
     `Workspace: ${codexWorkdir}`,
   ].join("\n");
@@ -223,12 +240,7 @@ async function runCodex(chatId, prompt, resume) {
 
   const { command, args, cwd } = buildCodexCommand(prompt, resume);
 
-  await sendMessage(
-    chatId,
-    execMode === "zeabur"
-      ? `Starting Codex task in Zeabur service ${codexTargetServiceId}`
-      : `Starting Codex task in ${codexWorkdir}`,
-  );
+  await sendMessage(chatId, "处理中...");
 
   let stdout = "";
   let stderr = "";
@@ -274,7 +286,9 @@ async function runCodex(chatId, prompt, resume) {
         : `Codex exited with code ${code}${signal ? `, signal ${signal}` : ""}.`;
 
     if (finalOutput) {
-      await sendLongMessage(chatId, `${header}\n\n${finalOutput}`);
+      const reply = extractCodexReply(finalOutput);
+      chatState.set(chatId, { shouldResume: true });
+      await sendLongMessage(chatId, reply || header);
     } else if (diagnostic) {
       await sendLongMessage(chatId, `${header}\n\n${tail(diagnostic, 3000)}`);
     } else {
@@ -292,6 +306,9 @@ function buildCodexCommand(prompt, resume) {
           "--ask-for-approval",
           codexApproval,
           "exec",
+          "--skip-git-repo-check",
+          "--color",
+          "never",
           "resume",
           "--last",
           prompt,
@@ -331,7 +348,17 @@ function buildCodexCommand(prompt, resume) {
   return {
     command: "codex",
     args: resume
-      ? ["--ask-for-approval", codexApproval, "exec", "resume", "--last", prompt]
+      ? [
+          "--ask-for-approval",
+          codexApproval,
+          "exec",
+          "--skip-git-repo-check",
+          "--color",
+          "never",
+          "resume",
+          "--last",
+          prompt,
+        ]
       : [
           "--ask-for-approval",
           codexApproval,
@@ -383,6 +410,39 @@ function appendBounded(existing, next, limit) {
 
 function tail(value, limit) {
   return value.length <= limit ? value : value.slice(value.length - limit);
+}
+
+function extractCodexReply(output) {
+  const clean = stripAnsi(output).trim();
+  const lines = clean.split(/\r?\n/);
+  const markerIndex = findLastLine(lines, "codex");
+
+  if (markerIndex === -1) {
+    return clean;
+  }
+
+  const replyLines = [];
+  for (const line of lines.slice(markerIndex + 1)) {
+    if (line.trim() === "tokens used") {
+      break;
+    }
+    replyLines.push(line);
+  }
+
+  return replyLines.join("\n").trim() || clean;
+}
+
+function findLastLine(lines, target) {
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (lines[index].trim() === target) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function stripAnsi(value) {
+  return value.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "");
 }
 
 async function sendStartupMessage() {
