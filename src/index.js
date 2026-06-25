@@ -22,11 +22,26 @@ const codexWorkdir = path.resolve(
 const codexSandbox = process.env.CODEX_SANDBOX || "workspace-write";
 const codexApproval = process.env.CODEX_APPROVAL || "never";
 const codexModel = process.env.CODEX_MODEL || "";
+const execMode = process.env.EXEC_MODE || "local";
+const zeaburToken = process.env.ZEABUR_TOKEN || "";
+const codexTargetServiceId = process.env.CODEX_TARGET_SERVICE_ID || "";
+const codexTargetEnvId = process.env.CODEX_TARGET_ENV_ID || "";
+const codexTargetWorkdir = process.env.CODEX_TARGET_WORKDIR || "/home/node";
 const maxTaskMs = Number(process.env.MAX_TASK_MS || 15 * 60 * 1000);
 const maxOutputChars = Number(process.env.MAX_OUTPUT_CHARS || 32_000);
 const apiBase = `https://api.telegram.org/bot${token}`;
 
 fs.mkdirSync(codexWorkdir, { recursive: true });
+
+if (execMode === "zeabur") {
+  if (!zeaburToken || !codexTargetServiceId || !codexTargetEnvId) {
+    console.error(
+      "EXEC_MODE=zeabur requires ZEABUR_TOKEN, CODEX_TARGET_SERVICE_ID, and CODEX_TARGET_ENV_ID.",
+    );
+    process.exit(1);
+  }
+  await ensureZeaburLogin();
+}
 
 let updateOffset = 0;
 let currentTask = null;
@@ -171,10 +186,15 @@ async function whoamiText() {
     `User: ${os.userInfo().username}`,
     `Node: ${process.version}`,
     `Codex: ${codexVersion.trim() || "unknown"}`,
+    `Exec mode: ${execMode}`,
     `Workspace: ${codexWorkdir}`,
+    execMode === "zeabur" ? `Target service: ${codexTargetServiceId}` : "",
+    execMode === "zeabur" ? `Target workdir: ${codexTargetWorkdir}` : "",
     `Sandbox: ${codexSandbox}`,
     `Approval: ${codexApproval}`,
-  ].join("\n");
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function execFileText(command, args) {
@@ -196,26 +216,20 @@ async function runCodex(chatId, prompt, resume) {
     return;
   }
 
-  const args = resume
-    ? ["exec", "resume", "--last", prompt]
-    : [
-        "exec",
-        "--skip-git-repo-check",
-        "--sandbox",
-        codexSandbox,
-        "--ask-for-approval",
-        codexApproval,
-        ...(codexModel ? ["--model", codexModel] : []),
-        prompt,
-      ];
+  const { command, args, cwd } = buildCodexCommand(prompt, resume);
 
-  await sendMessage(chatId, `Starting Codex task in ${codexWorkdir}`);
+  await sendMessage(
+    chatId,
+    execMode === "zeabur"
+      ? `Starting Codex task in Zeabur service ${codexTargetServiceId}`
+      : `Starting Codex task in ${codexWorkdir}`,
+  );
 
   let stdout = "";
   let stderr = "";
-  const child = spawn("codex", args, {
-    cwd: codexWorkdir,
-    env: process.env,
+  const child = spawn(command, args, {
+    cwd,
+    env: runtimeEnv(),
     stdio: ["ignore", "pipe", "pipe"],
   });
 
@@ -262,6 +276,73 @@ async function runCodex(chatId, prompt, resume) {
       await sendMessage(chatId, header);
     }
   });
+}
+
+function buildCodexCommand(prompt, resume) {
+  if (execMode === "zeabur") {
+    const codexArgs = resume
+      ? ["--cd", codexTargetWorkdir, "exec", "resume", "--last", prompt]
+      : [
+          "--cd",
+          codexTargetWorkdir,
+          "exec",
+          "--skip-git-repo-check",
+          "--sandbox",
+          codexSandbox,
+          "--ask-for-approval",
+          codexApproval,
+          ...(codexModel ? ["--model", codexModel] : []),
+          prompt,
+        ];
+
+    return {
+      command: "zeabur",
+      args: [
+        "service",
+        "exec",
+        "--id",
+        codexTargetServiceId,
+        "--env-id",
+        codexTargetEnvId,
+        "--",
+        "codex",
+        ...codexArgs,
+      ],
+      cwd: projectRoot,
+    };
+  }
+
+  return {
+    command: "codex",
+    args: resume
+      ? ["exec", "resume", "--last", prompt]
+      : [
+          "exec",
+          "--skip-git-repo-check",
+          "--sandbox",
+          codexSandbox,
+          "--ask-for-approval",
+          codexApproval,
+          ...(codexModel ? ["--model", codexModel] : []),
+          prompt,
+        ],
+    cwd: codexWorkdir,
+  };
+}
+
+async function ensureZeaburLogin() {
+  const output = await execFileText("zeabur", ["auth", "login", "--token", zeaburToken]);
+  if (/error|failed|invalid/i.test(output)) {
+    console.error(`Zeabur login failed: ${output}`);
+    process.exit(1);
+  }
+}
+
+function runtimeEnv() {
+  return {
+    ...process.env,
+    PATH: `${path.join(projectRoot, "node_modules", ".bin")}:${process.env.PATH || ""}`,
+  };
 }
 
 async function cancelTask(chatId) {

@@ -15,6 +15,11 @@ Required values:
 - `TELEGRAM_BOT_TOKEN`: token from BotFather.
 - `ALLOWED_CHAT_IDS`: comma-separated Telegram chat IDs allowed to use the bot.
 - `CODEX_WORKDIR`: directory where Codex runs. Defaults to `./workspace`.
+- `EXEC_MODE`: `local` runs Codex inside the bot container; `zeabur` runs Codex in another Zeabur service through `zeabur service exec`.
+- `ZEABUR_TOKEN`: required when `EXEC_MODE=zeabur`.
+- `CODEX_TARGET_SERVICE_ID`: target Zeabur service ID that already has Codex CLI and auth.
+- `CODEX_TARGET_ENV_ID`: target Zeabur environment ID.
+- `CODEX_TARGET_WORKDIR`: working directory passed to Codex with `--cd` in the target service.
 
 Start:
 
@@ -35,5 +40,6 @@ npm start
 
 - Only chats listed in `ALLOWED_CHAT_IDS` can run commands.
 - The bot runs `codex exec` with `--sandbox workspace-write` by default.
+- In `EXEC_MODE=zeabur`, the bot runs `zeabur service exec` against the target Codex service.
 - The bot allows only one active Codex task at a time.
 - `.env`, logs, and workspace contents are ignored by git.
