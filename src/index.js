@@ -199,9 +199,14 @@ async function whoamiText() {
 
 function execFileText(command, args) {
   return new Promise((resolve) => {
-    execFile(command, args, { timeout: 10_000 }, (error, stdout, stderr) => {
-      resolve(error ? stderr || error.message : stdout);
-    });
+    execFile(
+      command,
+      args,
+      { timeout: 10_000, env: runtimeEnv() },
+      (error, stdout, stderr) => {
+        resolve(error ? stderr || error.message : stdout);
+      },
+    );
   });
 }
 
