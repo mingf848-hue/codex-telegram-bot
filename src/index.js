@@ -239,7 +239,7 @@ function execFileText(command, args) {
     execFile(
       command,
       args,
-      { timeout: 10_000, env: runtimeEnv() },
+      { timeout: 30_000, env: runtimeEnv() },
       (error, stdout, stderr) => {
         resolve(error ? stderr || error.message : stdout);
       },
@@ -433,6 +433,17 @@ function rememberSession(state, sessionId, prompt) {
 
 async function sendHistory(chatId) {
   const state = getChatState(chatId);
+  const remoteHistory = await loadCodexHistory();
+  const knownIds = new Set(state.history.map((item) => item.id));
+  for (const item of remoteHistory) {
+    if (!knownIds.has(item.id)) {
+      state.history.push(item);
+      knownIds.add(item.id);
+    }
+  }
+  state.history.sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
+  state.history = state.history.slice(0, 20);
+
   if (!state.history.length) {
     await sendMessage(chatId, "No recorded sessions yet.");
     return;
@@ -448,6 +459,54 @@ async function sendHistory(chatId) {
       ]),
     },
   });
+}
+
+async function loadCodexHistory() {
+  const output =
+    execMode === "zeabur"
+      ? await execFileText("zeabur", [
+          "service",
+          "exec",
+          "--id",
+          codexTargetServiceId,
+          "--env-id",
+          codexTargetEnvId,
+          "--",
+          "sh",
+          "-lc",
+          "tail -n 500 ~/.codex/history.jsonl 2>/dev/null || true",
+        ])
+      : await execFileText("sh", [
+          "-lc",
+          "tail -n 500 ~/.codex/history.jsonl 2>/dev/null || true",
+        ]);
+
+  const bySession = new Map();
+  for (const line of output.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) {
+      continue;
+    }
+
+    try {
+      const entry = JSON.parse(trimmed);
+      if (!entry.session_id || !entry.text) {
+        continue;
+      }
+
+      bySession.set(entry.session_id, {
+        id: entry.session_id,
+        title: String(entry.text).replace(/\s+/g, " ").slice(0, 60),
+        updatedAt: new Date(Number(entry.ts || 0) * 1000).toISOString(),
+      });
+    } catch {
+      // Ignore partial or non-JSON log lines emitted around service exec.
+    }
+  }
+
+  return [...bySession.values()]
+    .sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""))
+    .slice(0, 20);
 }
 
 async function handleCallbackQuery(query) {

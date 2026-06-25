@@ -31,7 +31,7 @@ npm start
 
 - `/start` or `/help`: show help.
 - `/status`: show whether a Codex task is running.
-- `/history`: choose one of the Codex sessions recorded by this bot.
+- `/history`: choose one of the recent Codex sessions from the target Codex service.
 - `/whoami`: show server, workspace, and Codex version.
 - `/codex <task>`: run a new non-interactive Codex task.
 - `/resume <task>`: continue the last non-interactive Codex session.
@@ -39,7 +39,7 @@ npm start
 - `/new` or `/clear`: make the next normal message start a fresh Codex session.
 - `/cancel`: stop the currently running Codex process.
 
-The bot registers Telegram slash commands with `setMyCommands`, so typing `/` in Telegram should show the command menu after the latest deployment starts.
+The bot registers Telegram slash commands with `setMyCommands`, so typing `/` in Telegram should show the command menu after the latest deployment starts. In `EXEC_MODE=zeabur`, `/history` reads `~/.codex/history.jsonl` from the target Codex service through `zeabur service exec`.
 
 ## Safety
 
