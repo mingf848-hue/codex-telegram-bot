@@ -51,6 +51,7 @@ process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
 console.log(`Codex Telegram Bot started. Workspace: ${codexWorkdir}`);
+await configureBotCommands();
 await sendStartupMessage();
 await pollLoop();
 
@@ -101,7 +102,7 @@ async function pollLoop() {
       const updates = await telegram("getUpdates", {
         offset: updateOffset,
         timeout: 50,
-        allowed_updates: ["message"],
+        allowed_updates: ["message", "callback_query"],
       });
 
       for (const update of updates.result || []) {
@@ -116,6 +117,11 @@ async function pollLoop() {
 }
 
 async function handleUpdate(update) {
+  if (update.callback_query) {
+    await handleCallbackQuery(update.callback_query);
+    return;
+  }
+
   const message = update.message;
   if (!message || !message.chat || typeof message.text !== "string") {
     return;
@@ -134,11 +140,12 @@ async function handleUpdate(update) {
   }
 
   if (text === "/status") {
+    const state = chatState.get(chatId);
     await sendMessage(
       chatId,
       currentTask
         ? `Running: ${currentTask.label}\nStarted: ${currentTask.startedAt.toISOString()}`
-        : "Idle.",
+        : `Idle.${state?.activeSessionId ? `\nActive session: ${shortId(state.activeSessionId)}` : ""}`,
     );
     return;
   }
@@ -149,8 +156,13 @@ async function handleUpdate(update) {
   }
 
   if (text === "/new" || text === "/clear") {
-    chatState.set(chatId, { shouldResume: false });
+    setChatState(chatId, { shouldResume: false, activeSessionId: "" });
     await sendMessage(chatId, "New Codex conversation ready.");
+    return;
+  }
+
+  if (text === "/history") {
+    await sendHistory(chatId);
     return;
   }
 
@@ -160,12 +172,16 @@ async function handleUpdate(update) {
   }
 
   if (text.startsWith("/codex ")) {
-    await runCodex(chatId, text.slice("/codex ".length).trim(), false);
+    await runCodex(chatId, text.slice("/codex ".length).trim(), { resume: false });
     return;
   }
 
   if (text.startsWith("/resume ")) {
-    await runCodex(chatId, text.slice("/resume ".length).trim(), true);
+    const state = getChatState(chatId);
+    await runCodex(chatId, text.slice("/resume ".length).trim(), {
+      resume: true,
+      sessionId: state.activeSessionId,
+    });
     return;
   }
 
@@ -174,8 +190,11 @@ async function handleUpdate(update) {
     return;
   }
 
-  const state = chatState.get(chatId) || { shouldResume: false };
-  await runCodex(chatId, text, state.shouldResume);
+  const state = getChatState(chatId);
+  await runCodex(chatId, text, {
+    resume: state.shouldResume,
+    sessionId: state.activeSessionId,
+  });
 }
 
 function helpText() {
@@ -184,6 +203,7 @@ function helpText() {
     "",
     "/new - start a fresh Codex conversation on the next message",
     "/clear - same as /new",
+    "/history - choose a recorded Codex session",
     "/status - show current task",
     "/whoami - show server and Codex info",
     "/codex <task> - force a new Codex task",
@@ -227,7 +247,8 @@ function execFileText(command, args) {
   });
 }
 
-async function runCodex(chatId, prompt, resume) {
+async function runCodex(chatId, prompt, options = {}) {
+  const { resume = false, sessionId = "" } = options;
   if (!prompt) {
     await sendMessage(chatId, resume ? "Usage: /resume <task>" : "Usage: /codex <task>");
     return;
@@ -238,7 +259,7 @@ async function runCodex(chatId, prompt, resume) {
     return;
   }
 
-  const { command, args, cwd } = buildCodexCommand(prompt, resume);
+  const { command, args, cwd } = buildCodexCommand(prompt, { resume, sessionId });
 
   await sendMessage(chatId, "处理中...");
 
@@ -287,7 +308,16 @@ async function runCodex(chatId, prompt, resume) {
 
     if (finalOutput) {
       const reply = extractCodexReply(finalOutput);
-      chatState.set(chatId, { shouldResume: true });
+      const sessionIdFromOutput = extractSessionId(finalOutput) || sessionId;
+      const state = getChatState(chatId);
+      if (sessionIdFromOutput) {
+        rememberSession(state, sessionIdFromOutput, prompt);
+      }
+      setChatState(chatId, {
+        shouldResume: true,
+        activeSessionId: sessionIdFromOutput || state.activeSessionId,
+        history: state.history,
+      });
       await sendLongMessage(chatId, reply || header);
     } else if (diagnostic) {
       await sendLongMessage(chatId, `${header}\n\n${tail(diagnostic, 3000)}`);
@@ -297,7 +327,8 @@ async function runCodex(chatId, prompt, resume) {
   });
 }
 
-function buildCodexCommand(prompt, resume) {
+function buildCodexCommand(prompt, options = {}) {
+  const { resume = false, sessionId = "" } = options;
   if (execMode === "zeabur") {
     const codexArgs = resume
       ? [
@@ -310,7 +341,7 @@ function buildCodexCommand(prompt, resume) {
           "--color",
           "never",
           "resume",
-          "--last",
+          ...(sessionId ? [sessionId] : ["--last"]),
           prompt,
         ]
       : [
@@ -356,7 +387,7 @@ function buildCodexCommand(prompt, resume) {
           "--color",
           "never",
           "resume",
-          "--last",
+          ...(sessionId ? [sessionId] : ["--last"]),
           prompt,
         ]
       : [
@@ -373,6 +404,79 @@ function buildCodexCommand(prompt, resume) {
         ],
     cwd: codexWorkdir,
   };
+}
+
+function getChatState(chatId) {
+  const state = chatState.get(chatId);
+  if (state) {
+    return state;
+  }
+  const next = { shouldResume: false, activeSessionId: "", history: [] };
+  chatState.set(chatId, next);
+  return next;
+}
+
+function setChatState(chatId, patch) {
+  const state = getChatState(chatId);
+  chatState.set(chatId, { ...state, ...patch });
+}
+
+function rememberSession(state, sessionId, prompt) {
+  const existing = state.history.filter((item) => item.id !== sessionId);
+  existing.unshift({
+    id: sessionId,
+    title: prompt.replace(/\s+/g, " ").slice(0, 60) || "Codex session",
+    updatedAt: new Date().toISOString(),
+  });
+  state.history = existing.slice(0, 10);
+}
+
+async function sendHistory(chatId) {
+  const state = getChatState(chatId);
+  if (!state.history.length) {
+    await sendMessage(chatId, "No recorded sessions yet.");
+    return;
+  }
+
+  await sendMessage(chatId, "Choose a Codex session:", {
+    reply_markup: {
+      inline_keyboard: state.history.map((item) => [
+        {
+          text: `${shortId(item.id)} ${item.title}`,
+          callback_data: `history:${item.id}`,
+        },
+      ]),
+    },
+  });
+}
+
+async function handleCallbackQuery(query) {
+  const chatId = String(query.message?.chat?.id || "");
+  if (!chatId || !allowedChatIds.has(chatId)) {
+    await telegram("answerCallbackQuery", {
+      callback_query_id: query.id,
+      text: "Unauthorized chat.",
+      show_alert: true,
+    });
+    return;
+  }
+
+  const data = query.data || "";
+  if (data.startsWith("history:")) {
+    const sessionId = data.slice("history:".length);
+    setChatState(chatId, { shouldResume: true, activeSessionId: sessionId });
+    await telegram("answerCallbackQuery", {
+      callback_query_id: query.id,
+      text: `Selected ${shortId(sessionId)}`,
+    });
+    await sendMessage(chatId, `Selected session ${shortId(sessionId)}. Send a message to continue.`);
+    return;
+  }
+
+  await telegram("answerCallbackQuery", {
+    callback_query_id: query.id,
+    text: "Unknown action.",
+  });
 }
 
 async function ensureZeaburLogin() {
@@ -412,6 +516,12 @@ function tail(value, limit) {
   return value.length <= limit ? value : value.slice(value.length - limit);
 }
 
+function extractSessionId(output) {
+  const clean = stripAnsi(output);
+  const match = clean.match(/session id:\s*([0-9a-f-]{36})/i);
+  return match ? match[1] : "";
+}
+
 function extractCodexReply(output) {
   const clean = stripAnsi(output).trim();
   const lines = clean.split(/\r?\n/);
@@ -445,6 +555,28 @@ function stripAnsi(value) {
   return value.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "");
 }
 
+function shortId(sessionId) {
+  return sessionId ? sessionId.slice(0, 8) : "";
+}
+
+async function configureBotCommands() {
+  try {
+    await telegram("setMyCommands", {
+      commands: [
+        { command: "new", description: "Start a fresh Codex conversation" },
+        { command: "clear", description: "Start a fresh Codex conversation" },
+        { command: "history", description: "Choose a recorded Codex session" },
+        { command: "status", description: "Show current task" },
+        { command: "cancel", description: "Stop the running task" },
+        { command: "whoami", description: "Show server and Codex info" },
+        { command: "help", description: "Show help" },
+      ],
+    });
+  } catch (error) {
+    console.error(`Failed to configure bot commands: ${error.message}`);
+  }
+}
+
 async function sendStartupMessage() {
   for (const chatId of allowedChatIds) {
     try {
@@ -462,11 +594,12 @@ async function sendLongMessage(chatId, text) {
   }
 }
 
-async function sendMessage(chatId, text) {
+async function sendMessage(chatId, text, extra = {}) {
   await telegram("sendMessage", {
     chat_id: chatId,
     text,
     disable_web_page_preview: true,
+    ...extra,
   });
 }
 
