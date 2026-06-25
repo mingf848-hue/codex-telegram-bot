@@ -39,7 +39,9 @@ npm start
 - `/new` or `/clear`: make the next normal message start a fresh Codex session.
 - `/cancel`: stop the currently running Codex process.
 
-The bot registers Telegram slash commands with `setMyCommands`, so typing `/` in Telegram should show the command menu after the latest deployment starts. In `EXEC_MODE=zeabur`, `/history` reads `~/.codex/history.jsonl` from the target Codex service through `zeabur service exec`.
+The bot registers Telegram slash commands with `setMyCommands`, so typing `/` in Telegram should show the command menu after the latest deployment starts. In `EXEC_MODE=zeabur`, `/history` reads `~/.codex/history.jsonl` from the target Codex service through `zeabur service exec`; each button uses the first user message as its title and sorts sessions by latest activity.
+
+Codex runs with JSON event output. The bot edits one Telegram message as status/events arrive and replaces it with the final answer, so the temporary processing message does not remain in chat. Token-by-token streaming depends on the Codex CLI event output available from the target service.
 
 ## Safety
 

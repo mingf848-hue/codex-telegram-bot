@@ -261,10 +261,15 @@ async function runCodex(chatId, prompt, options = {}) {
 
   const { command, args, cwd } = buildCodexCommand(prompt, { resume, sessionId });
 
-  await sendMessage(chatId, "处理中...");
+  const statusMessage = await sendMessage(chatId, "思考中...");
+  const statusMessageId = statusMessage?.result?.message_id;
 
   let stdout = "";
   let stderr = "";
+  let lineBuffer = "";
+  let streamedReply = "";
+  let streamSessionId = sessionId;
+  let lastStatusEditAt = 0;
   const child = spawn(command, args, {
     cwd,
     env: runtimeEnv(),
@@ -282,7 +287,27 @@ async function runCodex(chatId, prompt, options = {}) {
   };
 
   child.stdout.on("data", (chunk) => {
-    stdout = appendBounded(stdout, chunk.toString(), maxOutputChars);
+    const text = chunk.toString();
+    stdout = appendBounded(stdout, text, maxOutputChars);
+    lineBuffer = processCodexJsonLines({
+      chatId,
+      messageId: statusMessageId,
+      input: lineBuffer + text,
+      onReply: (reply) => {
+        streamedReply = reply;
+      },
+      onSession: (nextSessionId) => {
+        streamSessionId = nextSessionId;
+      },
+      onStatus: (status) => {
+        const now = Date.now();
+        if (now - lastStatusEditAt < 1200) {
+          return;
+        }
+        lastStatusEditAt = now;
+        void editMessage(chatId, statusMessageId, status);
+      },
+    });
   });
 
   child.stderr.on("data", (chunk) => {
@@ -307,8 +332,8 @@ async function runCodex(chatId, prompt, options = {}) {
         : `Codex exited with code ${code}${signal ? `, signal ${signal}` : ""}.`;
 
     if (finalOutput) {
-      const reply = extractCodexReply(finalOutput);
-      const sessionIdFromOutput = extractSessionId(finalOutput) || sessionId;
+      const reply = streamedReply || extractCodexReply(finalOutput);
+      const sessionIdFromOutput = streamSessionId || extractSessionId(finalOutput) || sessionId;
       const state = getChatState(chatId);
       if (sessionIdFromOutput) {
         rememberSession(state, sessionIdFromOutput, prompt);
@@ -318,11 +343,21 @@ async function runCodex(chatId, prompt, options = {}) {
         activeSessionId: sessionIdFromOutput || state.activeSessionId,
         history: state.history,
       });
-      await sendLongMessage(chatId, reply || header);
+      if (reply && reply.length <= 3900 && statusMessageId) {
+        await editMessage(chatId, statusMessageId, reply);
+      } else {
+        await deleteMessage(chatId, statusMessageId);
+        await sendLongMessage(chatId, reply || header);
+      }
     } else if (diagnostic) {
+      await deleteMessage(chatId, statusMessageId);
       await sendLongMessage(chatId, `${header}\n\n${tail(diagnostic, 3000)}`);
     } else {
-      await sendMessage(chatId, header);
+      if (statusMessageId) {
+        await editMessage(chatId, statusMessageId, header);
+      } else {
+        await sendMessage(chatId, header);
+      }
     }
   });
 }
@@ -338,8 +373,7 @@ function buildCodexCommand(prompt, options = {}) {
           codexApproval,
           "exec",
           "--skip-git-repo-check",
-          "--color",
-          "never",
+          "--json",
           "resume",
           ...(sessionId ? [sessionId] : ["--last"]),
           prompt,
@@ -353,8 +387,7 @@ function buildCodexCommand(prompt, options = {}) {
           "--skip-git-repo-check",
           "--sandbox",
           codexSandbox,
-          "--color",
-          "never",
+          "--json",
           ...(codexModel ? ["--model", codexModel] : []),
           prompt,
         ];
@@ -384,8 +417,7 @@ function buildCodexCommand(prompt, options = {}) {
           codexApproval,
           "exec",
           "--skip-git-repo-check",
-          "--color",
-          "never",
+          "--json",
           "resume",
           ...(sessionId ? [sessionId] : ["--last"]),
           prompt,
@@ -397,8 +429,7 @@ function buildCodexCommand(prompt, options = {}) {
           "--skip-git-repo-check",
           "--sandbox",
           codexSandbox,
-          "--color",
-          "never",
+          "--json",
           ...(codexModel ? ["--model", codexModel] : []),
           prompt,
         ],
@@ -422,10 +453,11 @@ function setChatState(chatId, patch) {
 }
 
 function rememberSession(state, sessionId, prompt) {
+  const current = state.history.find((item) => item.id === sessionId);
   const existing = state.history.filter((item) => item.id !== sessionId);
   existing.unshift({
     id: sessionId,
-    title: prompt.replace(/\s+/g, " ").slice(0, 60) || "Codex session",
+    title: current?.title || prompt.replace(/\s+/g, " ").slice(0, 60) || "Codex session",
     updatedAt: new Date().toISOString(),
   });
   state.history = existing.slice(0, 10);
@@ -474,11 +506,11 @@ async function loadCodexHistory() {
           "--",
           "sh",
           "-lc",
-          "tail -n 500 ~/.codex/history.jsonl 2>/dev/null || true",
+          "cat ~/.codex/history.jsonl 2>/dev/null || true",
         ])
       : await execFileText("sh", [
           "-lc",
-          "tail -n 500 ~/.codex/history.jsonl 2>/dev/null || true",
+          "cat ~/.codex/history.jsonl 2>/dev/null || true",
         ]);
 
   const bySession = new Map();
@@ -494,11 +526,17 @@ async function loadCodexHistory() {
         continue;
       }
 
-      bySession.set(entry.session_id, {
-        id: entry.session_id,
-        title: String(entry.text).replace(/\s+/g, " ").slice(0, 60),
-        updatedAt: new Date(Number(entry.ts || 0) * 1000).toISOString(),
-      });
+      const updatedAt = new Date(Number(entry.ts || 0) * 1000).toISOString();
+      const current = bySession.get(entry.session_id);
+      if (current) {
+        current.updatedAt = updatedAt;
+      } else {
+        bySession.set(entry.session_id, {
+          id: entry.session_id,
+          title: String(entry.text).replace(/\s+/g, " ").slice(0, 60),
+          updatedAt,
+        });
+      }
     } catch {
       // Ignore partial or non-JSON log lines emitted around service exec.
     }
@@ -582,6 +620,11 @@ function extractSessionId(output) {
 }
 
 function extractCodexReply(output) {
+  const jsonReply = extractCodexJsonReply(output);
+  if (jsonReply) {
+    return jsonReply;
+  }
+
   const clean = stripAnsi(output).trim();
   const lines = clean.split(/\r?\n/);
   const markerIndex = findLastLine(lines, "codex");
@@ -599,6 +642,87 @@ function extractCodexReply(output) {
   }
 
   return replyLines.join("\n").trim() || clean;
+}
+
+function extractCodexJsonReply(output) {
+  let reply = "";
+  for (const line of output.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) {
+      continue;
+    }
+
+    try {
+      const event = JSON.parse(trimmed);
+      if (event.type === "item.completed" && event.item?.type === "agent_message") {
+        reply = event.item.text || reply;
+      }
+    } catch {
+      // Ignore non-JSON wrapper output.
+    }
+  }
+  return reply.trim();
+}
+
+function processCodexJsonLines({ chatId, messageId, input, onReply, onSession, onStatus }) {
+  const lines = input.split(/\r?\n/);
+  const rest = lines.pop() || "";
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) {
+      continue;
+    }
+
+    try {
+      const event = JSON.parse(trimmed);
+      if (event.type === "thread.started" && event.thread_id) {
+        onSession(event.thread_id);
+        onStatus(`已连接会话 ${shortId(event.thread_id)}，思考中...`);
+      } else if (event.type === "turn.started") {
+        onStatus("已开始处理...");
+      } else if (event.type === "item.started") {
+        onStatus(describeStartedItem(event.item));
+      } else if (event.type === "item.completed") {
+        if (event.item?.type === "agent_message" && event.item.text) {
+          onReply(event.item.text.trim());
+          void editMessage(chatId, messageId, event.item.text.trim().slice(0, 3900));
+        } else {
+          onStatus(describeCompletedItem(event.item));
+        }
+      }
+    } catch {
+      // Ignore non-JSON wrapper output.
+    }
+  }
+
+  return rest;
+}
+
+function describeStartedItem(item) {
+  if (!item?.type) {
+    return "处理中...";
+  }
+  if (item.type === "command_execution") {
+    return `执行命令中: ${item.command || ""}`.slice(0, 3900);
+  }
+  if (item.type === "reasoning") {
+    return "思考中...";
+  }
+  return `处理中: ${item.type}`;
+}
+
+function describeCompletedItem(item) {
+  if (!item?.type) {
+    return "处理中...";
+  }
+  if (item.type === "command_execution") {
+    return `命令完成: ${item.command || ""}`.slice(0, 3900);
+  }
+  if (item.type === "reasoning") {
+    return "思考完成，整理回复...";
+  }
+  return `已完成: ${item.type}`;
 }
 
 function findLastLine(lines, target) {
@@ -654,12 +778,48 @@ async function sendLongMessage(chatId, text) {
 }
 
 async function sendMessage(chatId, text, extra = {}) {
-  await telegram("sendMessage", {
+  return telegram("sendMessage", {
     chat_id: chatId,
     text,
     disable_web_page_preview: true,
     ...extra,
   });
+}
+
+async function editMessage(chatId, messageId, text) {
+  if (!messageId || !text) {
+    return null;
+  }
+
+  try {
+    return await telegram("editMessageText", {
+      chat_id: chatId,
+      message_id: messageId,
+      text: text.slice(0, 3900),
+      disable_web_page_preview: true,
+    });
+  } catch (error) {
+    if (!/message is not modified/i.test(error.message)) {
+      console.error(`Failed to edit message: ${error.message}`);
+    }
+    return null;
+  }
+}
+
+async function deleteMessage(chatId, messageId) {
+  if (!messageId) {
+    return null;
+  }
+
+  try {
+    return await telegram("deleteMessage", {
+      chat_id: chatId,
+      message_id: messageId,
+    });
+  } catch (error) {
+    console.error(`Failed to delete message: ${error.message}`);
+    return null;
+  }
 }
 
 async function telegram(method, payload) {
