@@ -286,16 +286,27 @@ async function runCodex(chatId, prompt, resume) {
 function buildCodexCommand(prompt, resume) {
   if (execMode === "zeabur") {
     const codexArgs = resume
-      ? ["--cd", codexTargetWorkdir, "exec", "resume", "--last", prompt]
+      ? [
+          "--cd",
+          codexTargetWorkdir,
+          "--ask-for-approval",
+          codexApproval,
+          "exec",
+          "resume",
+          "--last",
+          prompt,
+        ]
       : [
           "--cd",
           codexTargetWorkdir,
+          "--ask-for-approval",
+          codexApproval,
           "exec",
           "--skip-git-repo-check",
           "--sandbox",
           codexSandbox,
-          "--ask-for-approval",
-          codexApproval,
+          "--color",
+          "never",
           ...(codexModel ? ["--model", codexModel] : []),
           prompt,
         ];
@@ -320,14 +331,16 @@ function buildCodexCommand(prompt, resume) {
   return {
     command: "codex",
     args: resume
-      ? ["exec", "resume", "--last", prompt]
+      ? ["--ask-for-approval", codexApproval, "exec", "resume", "--last", prompt]
       : [
+          "--ask-for-approval",
+          codexApproval,
           "exec",
           "--skip-git-repo-check",
           "--sandbox",
           codexSandbox,
-          "--ask-for-approval",
-          codexApproval,
+          "--color",
+          "never",
           ...(codexModel ? ["--model", codexModel] : []),
           prompt,
         ],
