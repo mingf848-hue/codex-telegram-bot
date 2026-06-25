@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 
 const projectRoot = path.resolve(new URL("..", import.meta.url).pathname);
 loadDotEnv(path.join(projectRoot, ".env"));
@@ -259,6 +260,11 @@ async function runCodex(chatId, prompt, options = {}) {
     return;
   }
 
+  if (execMode === "zeabur") {
+    await runCodexZeaburJob(chatId, prompt, { resume, sessionId });
+    return;
+  }
+
   const { command, args, cwd } = buildCodexCommand(prompt, { resume, sessionId });
 
   const statusMessage = await sendMessage(chatId, "思考中...");
@@ -360,6 +366,191 @@ async function runCodex(chatId, prompt, options = {}) {
       }
     }
   });
+}
+
+async function runCodexZeaburJob(chatId, prompt, options = {}) {
+  const { resume = false, sessionId = "" } = options;
+  const jobId = `job-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+  const remoteDir = `/tmp/codex-telegram-bot/${jobId}`;
+  const statusMessage = await sendMessage(chatId, "思考中...");
+  const statusMessageId = statusMessage?.result?.message_id;
+  const state = getChatState(chatId);
+
+  currentTask = {
+    child: null,
+    label: prompt.slice(0, 120),
+    startedAt: new Date(),
+    remoteDir,
+  };
+
+  const started = await startRemoteCodexJob(remoteDir, prompt, { resume, sessionId });
+  if (!started.ok) {
+    currentTask = null;
+    await editMessage(chatId, statusMessageId, `启动失败:\n${tail(started.output, 3000)}`);
+    return;
+  }
+
+  let stdout = "";
+  let stderr = "";
+  let lineBuffer = "";
+  let streamedReply = "";
+  let streamSessionId = sessionId;
+  let lastStatusEditAt = 0;
+  const startedAt = Date.now();
+
+  while (currentTask?.remoteDir === remoteDir) {
+    if (Date.now() - startedAt > maxTaskMs) {
+      await stopRemoteCodexJob(remoteDir);
+      currentTask = null;
+      await editMessage(chatId, statusMessageId, "任务超时，已请求停止。");
+      return;
+    }
+
+    const snapshot = await readRemoteCodexJob(remoteDir);
+    stdout = snapshot.stdout;
+    stderr = snapshot.stderr;
+
+    const nextChunk = stdout.slice(snapshot.previousLength || 0);
+    lineBuffer = processCodexJsonLines({
+      chatId,
+      messageId: statusMessageId,
+      input: lineBuffer + nextChunk,
+      onReply: (reply) => {
+        streamedReply = reply;
+      },
+      onSession: (nextSessionId) => {
+        streamSessionId = nextSessionId;
+      },
+      onStatus: (status) => {
+        const now = Date.now();
+        if (now - lastStatusEditAt < 1200) {
+          return;
+        }
+        lastStatusEditAt = now;
+        void editMessage(chatId, statusMessageId, status);
+      },
+    });
+    readRemoteCodexJob.previousLengths.set(remoteDir, stdout.length);
+
+    if (snapshot.exitCode !== "") {
+      currentTask = null;
+      const reply = streamedReply || extractCodexReply(stdout);
+      const sessionIdFromOutput = streamSessionId || extractSessionId(stdout) || sessionId;
+      if (sessionIdFromOutput) {
+        rememberSession(state, sessionIdFromOutput, prompt);
+      }
+      setChatState(chatId, {
+        shouldResume: true,
+        activeSessionId: sessionIdFromOutput || state.activeSessionId,
+        history: state.history,
+      });
+
+      if (snapshot.exitCode === "0" && reply) {
+        if (reply.length <= 3900 && statusMessageId) {
+          await editMessage(chatId, statusMessageId, reply);
+        } else {
+          await deleteMessage(chatId, statusMessageId);
+          await sendLongMessage(chatId, reply);
+        }
+      } else {
+        await editMessage(
+          chatId,
+          statusMessageId,
+          `Codex 退出码 ${snapshot.exitCode || "unknown"}\n\n${tail(stderr || stdout, 3000)}`,
+        );
+      }
+      return;
+    }
+
+    await sleep(2500);
+  }
+}
+
+async function startRemoteCodexJob(remoteDir, prompt, options = {}) {
+  const { resume = false, sessionId = "" } = options;
+  const promptB64 = Buffer.from(prompt, "utf8").toString("base64");
+  const codexCommand = buildRemoteCodexShellCommand({ resume, sessionId });
+  const script = [
+    `mkdir -p ${shellQuote(remoteDir)}`,
+    `printf %s ${shellQuote(promptB64)} | base64 -d > ${shellQuote(`${remoteDir}/prompt.txt`)}`,
+    `: > ${shellQuote(`${remoteDir}/stdout.log`)}`,
+    `: > ${shellQuote(`${remoteDir}/stderr.log`)}`,
+    `rm -f ${shellQuote(`${remoteDir}/exit.code`)}`,
+    `(${codexCommand} < ${shellQuote(`${remoteDir}/prompt.txt`)} > ${shellQuote(`${remoteDir}/stdout.log`)} 2> ${shellQuote(`${remoteDir}/stderr.log`)}; echo $? > ${shellQuote(`${remoteDir}/exit.code`)}) & echo $! > ${shellQuote(`${remoteDir}/pid`)}`,
+  ].join("; ");
+  const output = await zeaburExec(["sh", "-lc", script]);
+  return { ok: !/ERROR|failed|Message:\s*5\d\d/i.test(output), output };
+}
+
+function buildRemoteCodexShellCommand(options = {}) {
+  const { resume = false, sessionId = "" } = options;
+  const args = [
+    "codex",
+    "--cd",
+    codexTargetWorkdir,
+    "--ask-for-approval",
+    codexApproval,
+    "exec",
+    "--skip-git-repo-check",
+    "--json",
+  ];
+
+  if (resume) {
+    args.push("resume");
+    if (sessionId) {
+      args.push(sessionId);
+    } else {
+      args.push("--last");
+    }
+    args.push("-");
+  } else {
+    args.push("--sandbox", codexSandbox);
+    if (codexModel) {
+      args.push("--model", codexModel);
+    }
+    args.push("-");
+  }
+
+  return args.map(shellQuote).join(" ");
+}
+
+async function readRemoteCodexJob(remoteDir) {
+  const output = await zeaburExec([
+    "sh",
+    "-lc",
+    [
+      `printf '__STDOUT__\\n'`,
+      `cat ${shellQuote(`${remoteDir}/stdout.log`)} 2>/dev/null || true`,
+      `printf '\\n__STDERR__\\n'`,
+      `cat ${shellQuote(`${remoteDir}/stderr.log`)} 2>/dev/null || true`,
+      `printf '\\n__EXIT__\\n'`,
+      `cat ${shellQuote(`${remoteDir}/exit.code`)} 2>/dev/null || true`,
+    ].join("; "),
+  ]);
+  const stdout = betweenMarkers(output, "__STDOUT__", "__STDERR__");
+  const stderr = betweenMarkers(output, "__STDERR__", "__EXIT__");
+  const exitCode = output.split("__EXIT__").pop()?.trim().split(/\s+/)[0] || "";
+  const previousLength = readRemoteCodexJob.previousLengths.get(remoteDir) || 0;
+  return { stdout, stderr, exitCode, previousLength };
+}
+readRemoteCodexJob.previousLengths = new Map();
+
+async function stopRemoteCodexJob(remoteDir) {
+  const script = `if [ -f ${shellQuote(`${remoteDir}/pid`)} ]; then kill "$(cat ${shellQuote(`${remoteDir}/pid`)})" 2>/dev/null || true; fi`;
+  await zeaburExec(["sh", "-lc", script]);
+}
+
+async function zeaburExec(remoteArgs) {
+  return execFileText("zeabur", [
+    "service",
+    "exec",
+    "--id",
+    codexTargetServiceId,
+    "--env-id",
+    codexTargetEnvId,
+    "--",
+    ...remoteArgs,
+  ]);
 }
 
 function buildCodexCommand(prompt, options = {}) {
@@ -471,6 +662,12 @@ async function sendHistory(chatId) {
     if (!knownIds.has(item.id)) {
       state.history.push(item);
       knownIds.add(item.id);
+    } else {
+      const current = state.history.find((historyItem) => historyItem.id === item.id);
+      if (current) {
+        current.title = item.title;
+        current.updatedAt = item.updatedAt;
+      }
     }
   }
   state.history.sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
@@ -597,7 +794,12 @@ async function cancelTask(chatId) {
     return;
   }
 
-  currentTask.child.kill("SIGTERM");
+  if (currentTask.remoteDir) {
+    await stopRemoteCodexJob(currentTask.remoteDir);
+  } else if (currentTask.child) {
+    currentTask.child.kill("SIGTERM");
+  }
+  currentTask = null;
   await sendMessage(chatId, "Cancellation requested.");
 }
 
@@ -738,6 +940,21 @@ function stripAnsi(value) {
   return value.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "");
 }
 
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function betweenMarkers(value, startMarker, endMarker) {
+  const start = value.indexOf(startMarker);
+  if (start === -1) {
+    return "";
+  }
+  const contentStart = start + startMarker.length;
+  const end = value.indexOf(endMarker, contentStart);
+  const content = end === -1 ? value.slice(contentStart) : value.slice(contentStart, end);
+  return content.replace(/^\r?\n/, "").replace(/\r?\n$/, "");
+}
+
 function shortId(sessionId) {
   return sessionId ? sessionId.slice(0, 8) : "";
 }
@@ -842,7 +1059,9 @@ function sleep(ms) {
 
 function shutdown() {
   if (currentTask) {
-    currentTask.child.kill("SIGTERM");
+    if (currentTask.child) {
+      currentTask.child.kill("SIGTERM");
+    }
   }
   process.exit(0);
 }
