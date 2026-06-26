@@ -147,7 +147,7 @@ async function handleUpdate(update) {
       chatId,
       currentTask
         ? `Running: ${currentTask.label}\nStarted: ${currentTask.startedAt.toISOString()}`
-        : `Idle.${state?.activeSessionId ? `\nActive session: ${shortId(state.activeSessionId)}` : ""}`,
+        : `Idle.${state?.activeSessionId ? "\n已选择历史会话" : ""}`,
     );
     return;
   }
@@ -700,7 +700,7 @@ async function sendHistory(chatId) {
     reply_markup: {
       inline_keyboard: state.history.map((item) => [
         {
-          text: `${shortId(item.id)} ${item.title}`,
+          text: item.title,
           callback_data: `history:${item.id}`,
         },
       ]),
@@ -779,9 +779,9 @@ async function handleCallbackQuery(query) {
     setChatState(chatId, { shouldResume: true, activeSessionId: sessionId });
     await telegram("answerCallbackQuery", {
       callback_query_id: query.id,
-      text: `Selected ${shortId(sessionId)}`,
+      text: "Selected",
     });
-    await sendMessage(chatId, `Selected session ${shortId(sessionId)}. Send a message to continue.`);
+    await sendMessage(chatId, "已选择会话，发送消息即可继续。");
     return;
   }
 
@@ -901,7 +901,7 @@ function processCodexJsonLines({ chatId, messageId, input, onReply, onSession, o
       const event = JSON.parse(trimmed);
       if (event.type === "thread.started" && event.thread_id) {
         onSession(event.thread_id);
-        onStatus(`已连接会话 ${shortId(event.thread_id)}，思考中...`);
+        onStatus("已连接会话，思考中...");
       } else if (event.type === "turn.started") {
         onStatus("已开始处理...");
       } else if (event.type === "item.started") {
@@ -974,10 +974,6 @@ function betweenMarkers(value, startMarker, endMarker) {
   const end = value.indexOf(endMarker, contentStart);
   const content = end === -1 ? value.slice(contentStart) : value.slice(contentStart, end);
   return content.replace(/^\r?\n/, "").replace(/\r?\n$/, "");
-}
-
-function shortId(sessionId) {
-  return sessionId ? sessionId.slice(0, 8) : "";
 }
 
 async function configureBotCommands() {
