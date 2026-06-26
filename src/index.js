@@ -1005,7 +1005,7 @@ async function sendStartupMessage() {
 }
 
 async function sendLongMessage(chatId, text) {
-  const chunkSize = 3900;
+  const chunkSize = 3500;
   for (let index = 0; index < text.length; index += chunkSize) {
     await sendMessage(chatId, text.slice(index, index + chunkSize));
   }
@@ -1014,7 +1014,8 @@ async function sendLongMessage(chatId, text) {
 async function sendMessage(chatId, text, extra = {}) {
   return telegram("sendMessage", {
     chat_id: chatId,
-    text,
+    text: formatTelegramText(text),
+    parse_mode: "HTML",
     disable_web_page_preview: true,
     ...extra,
   });
@@ -1029,7 +1030,8 @@ async function editMessage(chatId, messageId, text) {
     return await telegram("editMessageText", {
       chat_id: chatId,
       message_id: messageId,
-      text: text.slice(0, 3900),
+      text: formatTelegramText(text).slice(0, 3900),
+      parse_mode: "HTML",
       disable_web_page_preview: true,
     });
   } catch (error) {
@@ -1038,6 +1040,40 @@ async function editMessage(chatId, messageId, text) {
     }
     return null;
   }
+}
+
+function formatTelegramText(text) {
+  const placeholders = [];
+  let value = String(text || "");
+
+  value = value.replace(/```([\s\S]*?)```/g, (_match, code) => {
+    const token = `\u0000CODE${placeholders.length}\u0000`;
+    placeholders.push(`<pre>${escapeHtml(code.trim())}</pre>`);
+    return token;
+  });
+
+  value = value.replace(/`([^`\n]+)`/g, (_match, code) => {
+    const token = `\u0000CODE${placeholders.length}\u0000`;
+    placeholders.push(`<code>${escapeHtml(code)}</code>`);
+    return token;
+  });
+
+  value = escapeHtml(value);
+  value = value.replace(/\*\*([^*\n][\s\S]*?[^*\n])\*\*/g, "<b>$1</b>");
+  value = value.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+
+  for (let index = 0; index < placeholders.length; index += 1) {
+    value = value.replace(`\u0000CODE${index}\u0000`, placeholders[index]);
+  }
+
+  return value;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 async function deleteMessage(chatId, messageId) {
