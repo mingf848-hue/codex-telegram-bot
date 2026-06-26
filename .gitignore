@@ -2,5 +2,6 @@
 *.log
 node_modules/
 run/
+data/*.json
 workspace/*
 !workspace/.gitkeep
