@@ -47,6 +47,7 @@ if (execMode === "zeabur") {
 let updateOffset = 0;
 let currentTask = null;
 const chatState = new Map();
+const remoteReadOffsets = new Map();
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
@@ -173,13 +174,13 @@ async function handleUpdate(update) {
   }
 
   if (text.startsWith("/codex ")) {
-    await runCodex(chatId, text.slice("/codex ".length).trim(), { resume: false });
+    void runCodex(chatId, text.slice("/codex ".length).trim(), { resume: false });
     return;
   }
 
   if (text.startsWith("/resume ")) {
     const state = getChatState(chatId);
-    await runCodex(chatId, text.slice("/resume ".length).trim(), {
+    void runCodex(chatId, text.slice("/resume ".length).trim(), {
       resume: true,
       sessionId: state.activeSessionId,
     });
@@ -192,7 +193,7 @@ async function handleUpdate(update) {
   }
 
   const state = getChatState(chatId);
-  await runCodex(chatId, text, {
+  void runCodex(chatId, text, {
     resume: state.shouldResume,
     sessionId: state.activeSessionId,
   });
@@ -249,26 +250,27 @@ function execFileText(command, args) {
 }
 
 async function runCodex(chatId, prompt, options = {}) {
-  const { resume = false, sessionId = "" } = options;
-  if (!prompt) {
-    await sendMessage(chatId, resume ? "Usage: /resume <task>" : "Usage: /codex <task>");
-    return;
-  }
+  try {
+    const { resume = false, sessionId = "" } = options;
+    if (!prompt) {
+      await sendMessage(chatId, resume ? "Usage: /resume <task>" : "Usage: /codex <task>");
+      return;
+    }
 
-  if (currentTask) {
-    await sendMessage(chatId, "A Codex task is already running. Use /cancel first.");
-    return;
-  }
+    if (currentTask) {
+      await sendMessage(chatId, "A Codex task is already running. Use /cancel first.");
+      return;
+    }
 
-  if (execMode === "zeabur") {
-    await runCodexZeaburJob(chatId, prompt, { resume, sessionId });
-    return;
-  }
+    if (execMode === "zeabur") {
+      await runCodexZeaburJob(chatId, prompt, { resume, sessionId });
+      return;
+    }
 
-  const { command, args, cwd } = buildCodexCommand(prompt, { resume, sessionId });
+    const { command, args, cwd } = buildCodexCommand(prompt, { resume, sessionId });
 
-  const statusMessage = await sendMessage(chatId, "思考中...");
-  const statusMessageId = statusMessage?.result?.message_id;
+    const statusMessage = await sendMessage(chatId, "思考中...");
+    const statusMessageId = statusMessage?.result?.message_id;
 
   let stdout = "";
   let stderr = "";
@@ -290,6 +292,8 @@ async function runCodex(chatId, prompt, options = {}) {
     child,
     label: prompt.slice(0, 120),
     startedAt: new Date(),
+    chatId,
+    statusMessageId,
   };
 
   child.stdout.on("data", (chunk) => {
@@ -326,7 +330,7 @@ async function runCodex(chatId, prompt, options = {}) {
     await sendMessage(chatId, `Failed to start Codex: ${error.message}`);
   });
 
-  child.on("close", async (code, signal) => {
+    child.on("close", async (code, signal) => {
     clearTimeout(timeout);
     currentTask = null;
 
@@ -365,7 +369,19 @@ async function runCodex(chatId, prompt, options = {}) {
         await sendMessage(chatId, header);
       }
     }
-  });
+    });
+  } catch (error) {
+    const task = currentTask;
+    currentTask = null;
+    if (task?.remoteDir) {
+      remoteReadOffsets.delete(task.remoteDir);
+    }
+    if (task?.statusMessageId) {
+      await editMessage(task.chatId || chatId, task.statusMessageId, `任务出错:\n${error.message}`);
+    } else {
+      await sendMessage(chatId, `任务出错:\n${error.message}`);
+    }
+  }
 }
 
 async function runCodexZeaburJob(chatId, prompt, options = {}) {
@@ -381,6 +397,8 @@ async function runCodexZeaburJob(chatId, prompt, options = {}) {
     label: prompt.slice(0, 120),
     startedAt: new Date(),
     remoteDir,
+    chatId,
+    statusMessageId,
   };
 
   const started = await startRemoteCodexJob(remoteDir, prompt, { resume, sessionId });
@@ -430,10 +448,11 @@ async function runCodexZeaburJob(chatId, prompt, options = {}) {
         void editMessage(chatId, statusMessageId, status);
       },
     });
-    readRemoteCodexJob.previousLengths.set(remoteDir, stdout.length);
+    remoteReadOffsets.set(remoteDir, stdout.length);
 
     if (snapshot.exitCode !== "") {
       currentTask = null;
+      remoteReadOffsets.delete(remoteDir);
       const reply = streamedReply || extractCodexReply(stdout);
       const sessionIdFromOutput = streamSessionId || extractSessionId(stdout) || sessionId;
       if (sessionIdFromOutput) {
@@ -530,10 +549,9 @@ async function readRemoteCodexJob(remoteDir) {
   const stdout = betweenMarkers(output, "__STDOUT__", "__STDERR__");
   const stderr = betweenMarkers(output, "__STDERR__", "__EXIT__");
   const exitCode = output.split("__EXIT__").pop()?.trim().split(/\s+/)[0] || "";
-  const previousLength = readRemoteCodexJob.previousLengths.get(remoteDir) || 0;
+  const previousLength = remoteReadOffsets.get(remoteDir) || 0;
   return { stdout, stderr, exitCode, previousLength };
 }
-readRemoteCodexJob.previousLengths = new Map();
 
 async function stopRemoteCodexJob(remoteDir) {
   const script = `if [ -f ${shellQuote(`${remoteDir}/pid`)} ]; then kill "$(cat ${shellQuote(`${remoteDir}/pid`)})" 2>/dev/null || true; fi`;
@@ -796,8 +814,11 @@ async function cancelTask(chatId) {
 
   if (currentTask.remoteDir) {
     await stopRemoteCodexJob(currentTask.remoteDir);
+    remoteReadOffsets.delete(currentTask.remoteDir);
+    await editMessage(currentTask.chatId || chatId, currentTask.statusMessageId, "已取消。");
   } else if (currentTask.child) {
     currentTask.child.kill("SIGTERM");
+    await editMessage(currentTask.chatId || chatId, currentTask.statusMessageId, "已取消。");
   }
   currentTask = null;
   await sendMessage(chatId, "Cancellation requested.");
