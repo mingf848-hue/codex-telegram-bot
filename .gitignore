@@ -3,5 +3,6 @@
 node_modules/
 run/
 data/*.json
+telegram_uploads/
 workspace/*
 !workspace/.gitkeep

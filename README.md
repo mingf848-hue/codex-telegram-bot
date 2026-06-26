@@ -38,6 +38,7 @@ npm start
 - Any normal message: send it directly to Codex. The bot resumes the previous Codex session unless `/new` or `/clear` was used.
 - `/new` or `/clear`: make the next normal message start a fresh Codex session.
 - `/cancel`: stop the currently running Codex process.
+- Any file/document/photo/video/audio/voice message: save it under `/home/node/telegram_uploads`.
 
 The bot registers Telegram slash commands with `setMyCommands`, so typing `/` in Telegram should show the command menu after the latest deployment starts. In `EXEC_MODE=zeabur`, `/history` reads `~/.codex/history.jsonl` from the target Codex service through `zeabur service exec`; each button uses the first user message as its title and sorts sessions by latest activity.
 

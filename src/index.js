@@ -30,9 +30,11 @@ const codexTargetEnvId = process.env.CODEX_TARGET_ENV_ID || "";
 const codexTargetWorkdir = process.env.CODEX_TARGET_WORKDIR || "/home/node";
 const maxTaskMs = Number(process.env.MAX_TASK_MS || 15 * 60 * 1000);
 const maxOutputChars = Number(process.env.MAX_OUTPUT_CHARS || 32_000);
+const uploadDir = process.env.TELEGRAM_UPLOAD_DIR || "/home/node/telegram_uploads";
 const apiBase = `https://api.telegram.org/bot${token}`;
 
 fs.mkdirSync(codexWorkdir, { recursive: true });
+fs.mkdirSync(uploadDir, { recursive: true });
 
 if (execMode === "zeabur") {
   if (!zeaburToken || !codexTargetServiceId || !codexTargetEnvId) {
@@ -125,13 +127,22 @@ async function handleUpdate(update) {
   }
 
   const message = update.message;
-  if (!message || !message.chat || typeof message.text !== "string") {
+  if (!message || !message.chat) {
     return;
   }
 
   const chatId = String(message.chat.id);
   if (!allowedChatIds.has(chatId)) {
     await sendMessage(chatId, "Unauthorized chat.");
+    return;
+  }
+
+  if (hasTelegramFile(message)) {
+    await handleFileMessage(chatId, message);
+    return;
+  }
+
+  if (typeof message.text !== "string") {
     return;
   }
 
@@ -213,9 +224,115 @@ function helpText() {
     "/cancel - stop the running task",
     "",
     "Send any normal message to talk to Codex.",
+    `Send a file to upload it to ${uploadDir}.`,
     "",
     `Workspace: ${codexWorkdir}`,
   ].join("\n");
+}
+
+function hasTelegramFile(message) {
+  return Boolean(message.document || message.photo || message.video || message.audio || message.voice || message.animation);
+}
+
+async function handleFileMessage(chatId, message) {
+  try {
+    const file = extractTelegramFile(message);
+    if (!file) {
+      await sendMessage(chatId, "Unsupported file message.");
+      return;
+    }
+
+    const info = await telegram("getFile", { file_id: file.fileId });
+    const filePath = info.result?.file_path;
+    if (!filePath) {
+      await sendMessage(chatId, "Failed to get Telegram file path.");
+      return;
+    }
+
+    const targetDir = path.join(uploadDir, new Date().toISOString().slice(0, 10));
+    fs.mkdirSync(targetDir, { recursive: true });
+
+    const extension = path.extname(file.name || filePath);
+    const baseName = sanitizeFileName(path.basename(file.name || filePath, extension)) || "telegram-file";
+    const targetPath = uniquePath(path.join(targetDir, `${baseName}${extension}`));
+
+    const response = await fetch(`https://api.telegram.org/file/bot${token}/${filePath}`);
+    if (!response.ok || !response.body) {
+      throw new Error(`download failed: ${response.status}`);
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    fs.writeFileSync(targetPath, Buffer.from(arrayBuffer));
+
+    await sendMessage(
+      chatId,
+      [
+        "文件已保存：",
+        `文件名：${path.basename(targetPath)}`,
+        `服务器路径：${targetPath}`,
+        "",
+        "你可以直接让我处理这个文件，例如：",
+        `分析 ${targetPath}`,
+      ].join("\n"),
+    );
+  } catch (error) {
+    await sendMessage(chatId, `文件保存失败：${error.message}`);
+  }
+}
+
+function extractTelegramFile(message) {
+  if (message.document) {
+    return {
+      fileId: message.document.file_id,
+      name: message.document.file_name || "document",
+    };
+  }
+  if (message.photo?.length) {
+    const photo = message.photo[message.photo.length - 1];
+    return { fileId: photo.file_id, name: `photo-${message.message_id}.jpg` };
+  }
+  if (message.video) {
+    return { fileId: message.video.file_id, name: message.video.file_name || `video-${message.message_id}.mp4` };
+  }
+  if (message.audio) {
+    return { fileId: message.audio.file_id, name: message.audio.file_name || `audio-${message.message_id}.mp3` };
+  }
+  if (message.voice) {
+    return { fileId: message.voice.file_id, name: `voice-${message.message_id}.ogg` };
+  }
+  if (message.animation) {
+    return {
+      fileId: message.animation.file_id,
+      name: message.animation.file_name || `animation-${message.message_id}.gif`,
+    };
+  }
+  return null;
+}
+
+function sanitizeFileName(value) {
+  return String(value)
+    .normalize("NFKC")
+    .replace(/[\/\\?%*:|"<>]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+}
+
+function uniquePath(filePath) {
+  if (!fs.existsSync(filePath)) {
+    return filePath;
+  }
+
+  const dir = path.dirname(filePath);
+  const ext = path.extname(filePath);
+  const base = path.basename(filePath, ext);
+  for (let index = 1; index < 1000; index += 1) {
+    const candidate = path.join(dir, `${base}-${index}${ext}`);
+    if (!fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  throw new Error("too many duplicate file names");
 }
 
 async function whoamiText() {
