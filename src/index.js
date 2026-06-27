@@ -31,6 +31,9 @@ const codexTargetWorkdir = process.env.CODEX_TARGET_WORKDIR || "/home/node";
 const maxTaskMs = Number(process.env.MAX_TASK_MS || 15 * 60 * 1000);
 const maxOutputChars = Number(process.env.MAX_OUTPUT_CHARS || 32_000);
 const uploadDir = process.env.TELEGRAM_UPLOAD_DIR || "/home/node/telegram_uploads";
+const knowledgeAnswerScript = process.env.KNOWLEDGE_ANSWER_SCRIPT || "/home/node/changshanbot/agent/answer.mjs";
+const knowledgeModel = process.env.KNOWLEDGE_CODEX_MODEL || "gpt-5.4-mini";
+const knowledgeTimeoutMs = Number(process.env.KNOWLEDGE_TIMEOUT_MS || 60_000);
 const apiBase = `https://api.telegram.org/bot${token}`;
 
 fs.mkdirSync(codexWorkdir, { recursive: true });
@@ -189,6 +192,11 @@ async function handleUpdate(update) {
     return;
   }
 
+  if (text.startsWith("/kb ")) {
+    void runKnowledgeAnswer(chatId, text.slice("/kb ".length).trim());
+    return;
+  }
+
   if (text.startsWith("/resume ")) {
     const state = getChatState(chatId);
     void runCodex(chatId, text.slice("/resume ".length).trim(), {
@@ -219,6 +227,7 @@ function helpText() {
     "/history - choose a recorded Codex session",
     "/status - show current task",
     "/whoami - show server and Codex info",
+    "/kb <question> - answer from changshanbot knowledge base using Codex gpt-5.4-mini",
     "/codex <task> - force a new Codex task",
     "/resume <task> - force resume of the last Codex exec session",
     "/cancel - stop the running task",
@@ -228,6 +237,86 @@ function helpText() {
     "",
     `Workspace: ${codexWorkdir}`,
   ].join("\n");
+}
+
+async function runKnowledgeAnswer(chatId, question) {
+  try {
+    if (!question) {
+      await sendMessage(chatId, "Usage: /kb <question>");
+      return;
+    }
+
+    if (currentTask) {
+      await sendMessage(chatId, "A task is already running. Use /cancel first.");
+      return;
+    }
+
+    const statusMessage = await sendMessage(chatId, "正在查询知识库...");
+    const statusMessageId = statusMessage?.result?.message_id;
+    const child = spawn("node", [knowledgeAnswerScript, question], {
+      cwd: path.dirname(knowledgeAnswerScript),
+      env: {
+        ...runtimeEnv(),
+        CODEX_MODEL: knowledgeModel,
+        CHANGSHANBOT_CODEX_TIMEOUT_MS: String(knowledgeTimeoutMs),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    const timeout = setTimeout(() => {
+      child.kill("SIGTERM");
+    }, knowledgeTimeoutMs + 10_000);
+
+    currentTask = {
+      child,
+      label: `/kb ${question}`.slice(0, 120),
+      startedAt: new Date(),
+      chatId,
+      statusMessageId,
+    };
+
+    child.stdout.on("data", (chunk) => {
+      stdout = appendBounded(stdout, chunk.toString(), maxOutputChars);
+    });
+
+    child.stderr.on("data", (chunk) => {
+      stderr = appendBounded(stderr, chunk.toString(), maxOutputChars);
+    });
+
+    child.on("close", async (code, signal) => {
+      clearTimeout(timeout);
+      currentTask = null;
+
+      const parsed = parseJsonObject(stdout);
+      if (parsed?.answer) {
+        const sourceLine = Array.isArray(parsed.hits) && parsed.hits[0]
+          ? `\n\n来源：${parsed.hits[0].collection} / ${parsed.hits[0].title}`
+          : "";
+        const timeoutLine = parsed.exitCode === 124
+          ? "\n\n注：Codex 超时，已使用本地知识库命中内容回复。"
+          : "";
+        await editOrSendLong(chatId, statusMessageId, `${parsed.answer}${sourceLine}${timeoutLine}`);
+        return;
+      }
+
+      const message = [
+        `知识库问答失败${typeof code === "number" ? `，退出码 ${code}` : ""}${signal ? `，信号 ${signal}` : ""}。`,
+        tail(stderr || stdout || "没有输出。", 3000),
+      ].join("\n\n");
+      await editOrSendLong(chatId, statusMessageId, message);
+    });
+
+    child.on("error", async (error) => {
+      clearTimeout(timeout);
+      currentTask = null;
+      await editOrSendLong(chatId, statusMessageId, `知识库问答启动失败：${error.message}`);
+    });
+  } catch (error) {
+    currentTask = null;
+    await sendMessage(chatId, `知识库问答出错：${error.message}`);
+  }
 }
 
 function hasTelegramFile(message) {
@@ -1004,6 +1093,29 @@ function extractCodexJsonReply(output) {
   return reply.trim();
 }
 
+function parseJsonObject(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start === -1 || end === -1 || end <= start) {
+      return null;
+    }
+
+    try {
+      return JSON.parse(text.slice(start, end + 1));
+    } catch {
+      return null;
+    }
+  }
+}
+
 function processCodexJsonLines({ chatId, messageId, input, onReply, onSession, onStatus }) {
   const lines = input.split(/\r?\n/);
   const rest = lines.pop() || "";
@@ -1103,6 +1215,7 @@ async function configureBotCommands() {
         { command: "status", description: "Show current task" },
         { command: "cancel", description: "Stop the running task" },
         { command: "whoami", description: "Show server and Codex info" },
+        { command: "kb", description: "Ask changshanbot knowledge base" },
         { command: "help", description: "Show help" },
       ],
     });
@@ -1126,6 +1239,18 @@ async function sendLongMessage(chatId, text) {
   for (let index = 0; index < text.length; index += chunkSize) {
     await sendMessage(chatId, text.slice(index, index + chunkSize));
   }
+}
+
+async function editOrSendLong(chatId, messageId, text) {
+  if (messageId && text.length <= 3900) {
+    await editMessage(chatId, messageId, text);
+    return;
+  }
+
+  if (messageId) {
+    await deleteMessage(chatId, messageId);
+  }
+  await sendLongMessage(chatId, text);
 }
 
 async function sendMessage(chatId, text, extra = {}) {
