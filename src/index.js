@@ -32,7 +32,6 @@ const maxTaskMs = Number(process.env.MAX_TASK_MS || 15 * 60 * 1000);
 const maxOutputChars = Number(process.env.MAX_OUTPUT_CHARS || 32_000);
 const uploadDir = process.env.TELEGRAM_UPLOAD_DIR || "/home/node/telegram_uploads";
 const knowledgeAnswerScript = process.env.KNOWLEDGE_ANSWER_SCRIPT || "/home/node/changshanbot/agent/answer.mjs";
-const knowledgeModel = process.env.KNOWLEDGE_CODEX_MODEL || "gpt-5.4-mini";
 const knowledgeTimeoutMs = Number(process.env.KNOWLEDGE_TIMEOUT_MS || 60_000);
 const apiBase = `https://api.telegram.org/bot${token}`;
 
@@ -257,8 +256,7 @@ async function runKnowledgeAnswer(chatId, question) {
       cwd: path.dirname(knowledgeAnswerScript),
       env: {
         ...runtimeEnv(),
-        CODEX_MODEL: knowledgeModel,
-        CHANGSHANBOT_CODEX_TIMEOUT_MS: String(knowledgeTimeoutMs),
+        CHANGSHANBOT_GEMINI_TIMEOUT_MS: String(knowledgeTimeoutMs),
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -294,8 +292,8 @@ async function runKnowledgeAnswer(chatId, question) {
         const sourceLine = Array.isArray(parsed.hits) && parsed.hits[0]
           ? `\n\n来源：${parsed.hits[0].collection} / ${parsed.hits[0].title}`
           : "";
-        const timeoutLine = parsed.exitCode === 124
-          ? "\n\n注：Codex 超时，已使用本地知识库命中内容回复。"
+        const timeoutLine = parsed.provider !== "gemini" || parsed.exitCode !== 0
+          ? "\n\n注：Gemini 未返回可用答案，已使用本地知识库命中内容回复。"
           : "";
         await editOrSendLong(chatId, statusMessageId, `${parsed.answer}${sourceLine}${timeoutLine}`);
         return;
