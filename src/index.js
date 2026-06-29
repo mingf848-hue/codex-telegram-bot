@@ -31,12 +31,15 @@ const codexTargetWorkdir = process.env.CODEX_TARGET_WORKDIR || "/home/node";
 const maxTaskMs = Number(process.env.MAX_TASK_MS || 15 * 60 * 1000);
 const maxOutputChars = Number(process.env.MAX_OUTPUT_CHARS || 32_000);
 const uploadDir = process.env.TELEGRAM_UPLOAD_DIR || "/home/node/telegram_uploads";
+const uploadRetentionMs = Number(process.env.TELEGRAM_UPLOAD_RETENTION_MS || 24 * 60 * 60 * 1000);
 const knowledgeAnswerScript = process.env.KNOWLEDGE_ANSWER_SCRIPT || "/home/node/changshanbot/agent/answer.mjs";
 const knowledgeTimeoutMs = Number(process.env.KNOWLEDGE_TIMEOUT_MS || 60_000);
 const apiBase = `https://api.telegram.org/bot${token}`;
 
 fs.mkdirSync(codexWorkdir, { recursive: true });
 fs.mkdirSync(uploadDir, { recursive: true });
+cleanupUploadDir();
+setInterval(cleanupUploadDir, 60 * 60 * 1000).unref();
 
 if (execMode === "zeabur") {
   if (!zeaburToken || !codexTargetServiceId || !codexTargetEnvId) {
@@ -323,6 +326,8 @@ function hasTelegramFile(message) {
 
 async function handleFileMessage(chatId, message) {
   try {
+    cleanupUploadDir();
+
     const file = extractTelegramFile(message);
     if (!file) {
       await sendMessage(chatId, "Unsupported file message.");
@@ -350,6 +355,7 @@ async function handleFileMessage(chatId, message) {
 
     const arrayBuffer = await response.arrayBuffer();
     fs.writeFileSync(targetPath, Buffer.from(arrayBuffer));
+    cleanupUploadDir();
 
     await sendMessage(
       chatId,
@@ -365,6 +371,55 @@ async function handleFileMessage(chatId, message) {
   } catch (error) {
     await sendMessage(chatId, `文件保存失败：${error.message}`);
   }
+}
+
+function cleanupUploadDir() {
+  if (!Number.isFinite(uploadRetentionMs) || uploadRetentionMs <= 0) {
+    return;
+  }
+
+  const cutoff = Date.now() - uploadRetentionMs;
+  try {
+    pruneUploadPath(uploadDir, cutoff, true);
+  } catch (error) {
+    console.error(`Upload cleanup failed: ${error.message}`);
+  }
+}
+
+function pruneUploadPath(targetPath, cutoff, keepRoot = false) {
+  let stats;
+  try {
+    stats = fs.lstatSync(targetPath);
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      console.error(`Failed to stat upload path ${targetPath}: ${error.message}`);
+    }
+    return false;
+  }
+
+  if (!stats.isDirectory()) {
+    if (stats.mtimeMs < cutoff) {
+      fs.rmSync(targetPath, { force: true });
+      return true;
+    }
+    return false;
+  }
+
+  let removedChildren = false;
+  for (const entry of fs.readdirSync(targetPath)) {
+    const childPath = path.join(targetPath, entry);
+    removedChildren = pruneUploadPath(childPath, cutoff) || removedChildren;
+  }
+
+  if (!keepRoot) {
+    const remainingEntries = fs.readdirSync(targetPath);
+    if (remainingEntries.length === 0) {
+      fs.rmdirSync(targetPath);
+      return true;
+    }
+  }
+
+  return removedChildren;
 }
 
 function extractTelegramFile(message) {

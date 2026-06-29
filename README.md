@@ -20,6 +20,7 @@ Required values:
 - `CODEX_TARGET_SERVICE_ID`: target Zeabur service ID that already has Codex CLI and auth.
 - `CODEX_TARGET_ENV_ID`: target Zeabur environment ID.
 - `CODEX_TARGET_WORKDIR`: working directory passed to Codex with `--cd` in the target service.
+- `TELEGRAM_UPLOAD_RETENTION_MS`: uploaded file retention window. Defaults to 24 hours.
 
 Start:
 
@@ -39,6 +40,7 @@ npm start
 - `/new` or `/clear`: make the next normal message start a fresh Codex session.
 - `/cancel`: stop the currently running Codex process.
 - Any file/document/photo/video/audio/voice message: save it under `/home/node/telegram_uploads`.
+- Uploaded files are cleaned up after 24 hours by default.
 
 The bot registers Telegram slash commands with `setMyCommands`, so typing `/` in Telegram should show the command menu after the latest deployment starts. In `EXEC_MODE=zeabur`, `/history` reads `~/.codex/history.jsonl` from the target Codex service through `zeabur service exec`; each button uses the first user message as its title and sorts sessions by latest activity.
 
